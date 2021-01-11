@@ -200,7 +200,7 @@ class AWSTask:
         return obj
 
     def get_parameters(self):
-        values = {p.get_name(): p.get_value for p in self.parameters}
+        values = {p.get_name(): p.get_value() for p in self.parameters}
         return values
 
     def store_result(self, result):
@@ -216,6 +216,7 @@ class AWSTaskServer:
         self.sqs = sqs
         self.s3 = s3
         self.task_queue = task_queue
+        self.exit_asap = False
 
     def fetch_task(self, wait_time_seconds=20, visibility_timeout=60*60):
         response = self.sqs.receive_message(
@@ -231,7 +232,18 @@ class AWSTaskServer:
         metadata = dict((k, sqs_message[k]) for k in ("MessageId", "ReceiptHandle"))
         task = AWSTask.from_message(message=message_body, s3=self.s3, metadata=metadata)
         return task
-    
+
+    def run(self, task_callback, max_tasks=-1, wait_time_seconds=20, visibility_timeout=60*60):
+        task_count = 0
+        while (max_tasks <= 0 or task_count < max_tasks) and not self.exit_asap:
+            task = self.fetch_task(wait_time_seconds, visibility_timeout)
+            if task is not None:
+                params = task.get_parameters()
+                result = task_callback(**params)
+                self.complete_task(task, result)
+                task_count += 1
+                #TODO: Error handling
+
     def complete_task(self, task:AWSTask, result):
         task.store_result(result)
         self.sqs.delete_message(
