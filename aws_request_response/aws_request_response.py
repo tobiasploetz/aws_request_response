@@ -1,3 +1,5 @@
+from typing import Dict, Iterable, Union
+
 import numpy as np
 import joblib
 import json
@@ -9,7 +11,7 @@ import time
 from botocore.exceptions import ClientError
 
 
-def create_taskid():
+def create_taskid() -> str:
     return uuid.uuid4().hex
 
 
@@ -121,7 +123,10 @@ class AWSS3Data():
         self.s3.delete_object(Bucket=self.s3_bucket, Key=self.s3_key)
 
 
-def parse_parameter(desc, s3):
+Parameter = Union[AWSDirectData, AWSS3Data]
+
+
+def parse_parameter(desc: dict, s3) -> Parameter:
     type = desc["Type"]
     if type == AWSS3Data.cls_str:
         param = AWSS3Data.from_message(desc, s3)
@@ -133,7 +138,7 @@ def parse_parameter(desc, s3):
     return param
 
 
-def create_parameter(name, value, taskid, bucket, prefix, s3):
+def create_parameter(name: str, value, taskid: str, bucket: str, prefix: str, s3) -> Parameter:
     param = None
     if isinstance(value, (int, float, bool, str)):
         param = AWSDirectData(name, value)
@@ -155,7 +160,7 @@ def create_parameter(name, value, taskid, bucket, prefix, s3):
 
 
 class AWSTask:
-    def __init__(self, taskid, parameters, result_data, s3, metadata=None):
+    def __init__(self, taskid: str, parameters: Iterable[Parameter], result_data: AWSS3Data, s3, metadata=None):
         self.metadata = metadata
         self.parameters = parameters
         self.result_data = result_data
@@ -164,6 +169,17 @@ class AWSTask:
 
     @classmethod
     def create_task(cls, bucket: str, prefix: str, s3, params: dict):
+        """
+        Creates a new task object. Parameters and results are communicated via
+        S3 with path {bucket}/{prefix}/{taskid}/{object_name}, taskid is auto-generated
+        and object_name is either the name of the parameter or 'results'.
+
+        :param bucket: Identifier of S3 bucket to store parameters and results
+        :param prefix: Prefix of stored objects inside S3
+        :param s3: Boto3 S3 client
+        :param params: parameter dictionary
+        :return:
+        """
         taskid = create_taskid()
         result_key = create_data_s3_key(prefix, taskid, "result", "joblib")
         result_data = AWSS3Data("result", bucket, result_key, s3)
@@ -175,7 +191,7 @@ class AWSTask:
         return task
 
     @classmethod
-    def from_message(cls, message, s3, metadata=None):
+    def from_message(cls, message: dict, s3, metadata=None):
         taskid = message["TaskId"]
         parameters = []
         for p in message["Parameters"]:
@@ -187,7 +203,7 @@ class AWSTask:
         task = AWSTask(taskid=taskid, parameters=parameters, result_data=result_data, s3=s3, metadata=metadata)
         return task
 
-    def to_message(self):
+    def to_message(self) -> dict:
         parameters = []
         for p in self.parameters:
             parameters.append(p.to_message())
@@ -199,7 +215,7 @@ class AWSTask:
             obj["Metadata"] = self.metadata
         return obj
 
-    def get_parameters(self):
+    def get_parameters(self) -> dict:
         values = {p.get_name(): p.get_value() for p in self.parameters}
         return values
 
@@ -212,13 +228,13 @@ class AWSTask:
 
 
 class AWSTaskServer:
-    def __init__(self, task_queue, s3, sqs):
+    def __init__(self, task_queue: str, s3, sqs):
         self.sqs = sqs
         self.s3 = s3
         self.task_queue = task_queue
         self.exit_asap = False
 
-    def fetch_task(self, wait_time_seconds=20, visibility_timeout=60*60):
+    def fetch_task(self, wait_time_seconds=20, visibility_timeout=60*60) -> AWSTask:
         response = self.sqs.receive_message(
             QueueUrl=self.task_queue,
             VisibilityTimeout=visibility_timeout,
@@ -244,7 +260,7 @@ class AWSTaskServer:
                 task_count += 1
                 #TODO: Error handling
 
-    def complete_task(self, task:AWSTask, result):
+    def complete_task(self, task: AWSTask, result):
         task.store_result(result)
         self.sqs.delete_message(
             QueueUrl=self.task_queue,
@@ -253,10 +269,15 @@ class AWSTaskServer:
 
 
 class AWSResultFuture:
-    def __init__(self, task:AWSTask):
+    def __init__(self, task: AWSTask):
         self.task = task
 
     def get_result(self):
+        """
+        Polls S3 whether result is available
+
+        :return: None if result is not yet available, otherwise the result
+        """
         try:
             value = self.task.result_data.get_value()
         except ClientError as e:
@@ -273,12 +294,18 @@ class AWSResultFuture:
 
 
 class AWSTaskClient:
-    def __init__(self, task_queue, s3, sqs):
+    def __init__(self, task_queue: str, s3, sqs):
         self.sqs = sqs
         self.s3 = s3
         self.task_queue = task_queue
 
-    def submit(self, task:AWSTask):
+    def submit(self, task: AWSTask) -> AWSResultFuture:
+        """
+        Submits a job without blocking.
+
+        :param task: The task object describing the data to be submitted
+        :return: A future that allows to query for the result of the task
+        """
         task.result_data.set_value(None)
         message_body = json.dumps(task.to_message())
         for param in task.parameters:
@@ -287,7 +314,15 @@ class AWSTaskClient:
         future = AWSResultFuture(task)
         return future
 
-    def submit_and_wait(self, task: AWSTask, timeout:int, poll_wait_time=10):
+    def submit_and_wait(self, task: AWSTask, timeout: int, poll_wait_time=10):
+        """
+        Submits a job and blocks until the result is available or until a specified timeout.
+
+        :param task: The task object describing the data to be submitted
+        :param timeout: The timeout (seconds). If there is no result available until then, a TimeoutError will be raised
+        :param poll_wait_time: Time delay between two polls to S3
+        :return: The result if available
+        """
         future = self.submit(task)
         t_start = time.time()
         while time.time() - t_start < timeout:
